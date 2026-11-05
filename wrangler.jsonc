@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "home-inventory",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/img/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "home-inventory",
+      // Replace with the id printed by `npx wrangler d1 create home-inventory`
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [{ "binding": "PHOTOS", "bucket_name": "home-inventory-photos" }],
+  "vars": {
+    "CLAUDE_MODEL": "claude-opus-5-5"
+  },
+  // Requires willgunderson.com to be a zone on your Cloudflare account.
+  "routes": [{ "pattern": "home.willgunderson.com", "custom_domain": true }],
+  "observability": { "enabled": true }
+}
