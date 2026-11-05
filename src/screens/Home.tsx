@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { go, useStore } from "../store";
 import { Icon, ItemTile } from "../ui";
 import { money } from "../lib/listing";
+import { currentValue, daysUntil, fmtDate, warrantyEndingSoon } from "../lib/value";
 
 export default function Home() {
   const { rooms, items, loaded } = useStore();
@@ -13,6 +14,10 @@ export default function Home() {
     return {
       count: sum(owned, (i) => i.quantity),
       replacement: sum(owned, (i) => i.replacement_value * i.quantity),
+      worth: sum(owned, (i) => currentValue(i).value * i.quantity),
+      warranties: owned
+        .filter(warrantyEndingSoon)
+        .sort((a, b) => a.warranty_expires.localeCompare(b.warranty_expires)),
       forSale: sum(owned.filter((i) => i.decision === "sell"), (i) => (i.asking_price || i.resale_high) * i.quantity),
       sold: sum(items.filter((i) => i.status === "sold"), (i) => i.sold_price ?? 0),
       review: owned.filter((i) => !i.decision_confirmed).length,
@@ -55,6 +60,24 @@ export default function Home() {
         </>
       ) : (
         <>
+          {stats.warranties.length > 0 && (
+            <div className="card alert" style={{ marginBottom: 12 }}>
+              <div className="row" style={{ marginBottom: 6 }}>
+                <Icon name="shield" size={18} />
+                <b className="grow">Warrant{stats.warranties.length === 1 ? "y" : "ies"} ending soon</b>
+              </div>
+              {stats.warranties.map((i) => {
+                const d = daysUntil(i.warranty_expires) ?? 0;
+                return (
+                  <a key={i.id} href={`#/item/${i.id}`} className="alertrow">
+                    <span className="grow">{i.name}</span>
+                    <span className="small">{d === 0 ? "today" : d === 1 ? "tomorrow" : `in ${d} days`} · {fmtDate(i.warranty_expires)}</span>
+                  </a>
+                );
+              })}
+              <p className="tiny muted" style={{ margin: "6px 0 0" }}>Check for problems worth a claim while it's still covered.</p>
+            </div>
+          )}
           <div className="stats">
             <div className="stat">
               <b>{stats.count.toLocaleString()}</b>
@@ -62,7 +85,7 @@ export default function Home() {
             </div>
             <div className="stat">
               <b>{money(stats.replacement)}</b>
-              <span>replacement value</span>
+              <span>replacement value{stats.worth > 0 && <> · ~{money(stats.worth)} worth today</>}</span>
             </div>
             <div className="stat" onClick={() => go("/sell")} style={{ cursor: "pointer" }}>
               <b>{money(stats.forSale)}</b>

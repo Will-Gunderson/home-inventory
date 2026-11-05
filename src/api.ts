@@ -54,6 +54,13 @@ export interface Item {
   ebay_listing_id: string | null;
   ebay_listed_at: string | null;
   ebay_price_dropped: number;
+  model: string;
+  serial_number: string;
+  purchase_date: string;
+  purchase_price: number;
+  purchase_store: string;
+  warranty_expires: string;
+  warranty_note: string;
   created_at: string;
   updated_at: string;
 }
@@ -63,6 +70,18 @@ export interface Settings {
   sell_threshold: number;
   household_notes: string;
   ebay_postal_code: string;
+}
+
+export interface Doc {
+  id: string;
+  item_id: string;
+  kind: "receipt" | "manual" | "warranty" | "other";
+  title: string;
+  summary: string;
+  r2_key: string;
+  content_type: string;
+  pages: number | null;
+  created_at: string;
 }
 
 export interface EbayStatus {
@@ -157,6 +176,20 @@ export const api = {
   ebayDisconnect: () => req<EbayStatus>("/api/ebay/disconnect", { method: "POST" }),
   postToEbay: (id: string) => req<{ item: Item; url: string; category: string }>(`/api/items/${id}/ebay`, { method: "POST" }),
   endEbay: (id: string) => req<{ item: Item }>(`/api/items/${id}/ebay`, { method: "DELETE" }),
+
+  documents: (itemId: string) => req<Doc[]>(`/api/items/${itemId}/documents`),
+  uploadDocument: (itemId: string, file: Blob, filename: string, pages?: number) =>
+    req<{ item: Item; document: Doc; filled: string[]; note: string }>(`/api/items/${itemId}/documents`, {
+      method: "POST",
+      headers: {
+        "Content-Type": file.type || "application/octet-stream",
+        "X-Filename": encodeURIComponent(filename),
+        ...(pages ? { "X-Pages": String(pages) } : {}),
+      },
+      body: file,
+    }),
+  deleteDocument: (id: string) => req(`/api/documents/${id}`, { method: "DELETE" }),
+  transcribe: (wav: Blob) => req<{ text: string }>("/api/transcribe", { method: "POST", headers: { "Content-Type": "audio/wav" }, body: wav }),
 
   bundle: (ids: string[], kind: "garage_sale" | "marketplace_bundle", details: string) =>
     req<{ title: string; body: string; total: number }>("/api/bundle", json("POST", { ids, kind, details })),

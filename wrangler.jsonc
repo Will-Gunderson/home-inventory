@@ -17,6 +17,8 @@
       "migrations_dir": "migrations"
     }
   ],
+  // Workers AI: Whisper speech-to-text for voice notes.
+  "ai": { "binding": "AI" },
   "r2_buckets": [{ "binding": "PHOTOS", "bucket_name": "home-inventory-photos" }],
   "vars": {
     "CLAUDE_MODEL": "claude-opus-5-5"

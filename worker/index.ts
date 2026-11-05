@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer";
 import Anthropic from "@anthropic-ai/sdk";
 import { checkPasscode, clearCookie, hmac, isAuthed, sessionCookie } from "./auth";
 import { EbayError, authorizeUrl, disconnect, ebayConfigured, ebayCron, ebayStatus, endListing, exchangeCode, publishListing } from "./ebay";
-import { AiError, analyzePhoto, researchPrice, writeBundlePost, CATEGORIES, CONDITIONS, DECISIONS } from "./ai";
+import { AiError, analyzePhoto, normDate, readDocument, researchPrice, writeBundlePost, CATEGORIES, CONDITIONS, DECISIONS } from "./ai";
 
 type App = { Bindings: Env };
 const app = new Hono<App>();
@@ -232,13 +232,15 @@ async function analyzeAndStore(env: Env, photoId: string) {
         env.DB.prepare(
           `INSERT INTO items (id, room_id, photo_id, name, category, brand, description, condition, size, quantity,
              resale_low, resale_high, asking_price, replacement_value, decision, ai_reason, best_platform,
-             listing_title, listing_description, tags, bbox, image_key)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+             listing_title, listing_description, tags, bbox, image_key,
+             model, serial_number, purchase_date, purchase_price, purchase_store)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         ).bind(
           id, photo.room_id, photoId, it.name, it.category, it.brand, it.description, it.condition, it.size, it.quantity,
           it.resale_low, it.resale_high, it.asking_price, it.replacement_value, it.recommendation, it.recommendation_reason,
           it.best_platform, it.listing_title, it.listing_description, JSON.stringify(it.tags), JSON.stringify(it.bbox),
           photo.r2_key, // until the phone uploads a cropped version
+          it.model, it.serial_number, it.purchase_date, it.purchase_price, it.purchase_store,
         ),
       );
     }
@@ -343,6 +345,13 @@ const EDITABLE: Record<string, (v: unknown) => unknown> = {
   listed_on: (v) => JSON.stringify(Array.isArray(v) ? v.map(String) : []),
   sold_price: (v) => (v === null || v === "" ? null : Number(v)),
   notes: String,
+  model: String,
+  serial_number: String,
+  purchase_date: normDate,
+  purchase_price: (v) => Math.max(0, Number(v) || 0),
+  purchase_store: String,
+  warranty_expires: (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v)) ? v : ""),
+  warranty_note: String,
 };
 
 // Ending a live eBay listing when the item is gone some other way, so it can't sell twice.
@@ -382,7 +391,9 @@ app.post("/api/items/bulk", async (c) => {
   return c.json({ ok: true });
 });
 
-async function deleteItemFiles(env: Env, item: { image_key?: unknown; enhanced_key?: unknown; photo_id?: unknown }) {
+async function deleteItemFiles(env: Env, item: { id: string; image_key?: unknown; enhanced_key?: unknown; photo_id?: unknown }) {
+  const { results: docs } = await env.DB.prepare("SELECT r2_key FROM documents WHERE item_id = ?").bind(item.id).all<{ r2_key: string }>();
+  for (const d of docs) await env.PHOTOS.delete(d.r2_key);
   const photo = item.photo_id
     ? await env.DB.prepare("SELECT r2_key FROM photos WHERE id = ?").bind(item.photo_id).first<{ r2_key: string }>()
     : null;
@@ -455,6 +466,96 @@ app.post("/api/items/:id/research", async (c) => {
     return c.json(await getItem(c.env, item.id));
   } catch (e) {
     return c.json({ error: errorMessage(e) }, 502);
+  }
+});
+
+// ---------- documents (receipts, manuals, warranties) ----------
+
+const READABLE = ["application/pdf", "image/jpeg", "image/png", "image/webp", "image/gif"];
+
+app.get("/api/items/:id/documents", async (c) => {
+  const { results } = await c.env.DB.prepare("SELECT * FROM documents WHERE item_id = ? ORDER BY created_at DESC").bind(c.req.param("id")).all();
+  return c.json(results);
+});
+
+// Body is the raw file (PDF or image). The AI reads it and fills in purchase/warranty details the item is missing.
+app.post("/api/items/:id/documents", async (c) => {
+  const item = await getItem(c.env, c.req.param("id"));
+  if (!item) return c.json({ error: "Not found" }, 404);
+  const type = (c.req.header("Content-Type") ?? "application/octet-stream").split(";")[0];
+  const buf = await c.req.arrayBuffer();
+  if (!buf.byteLength) return c.json({ error: "Empty file" }, 400);
+  const id = crypto.randomUUID();
+  const ext = type === "application/pdf" ? "pdf" : type.split("/")[1]?.replace("jpeg", "jpg") || "bin";
+  const key = `docs/${item.id}/${id}.${ext}`;
+  await c.env.PHOTOS.put(key, buf, { httpMetadata: { contentType: type } });
+  const filename = decodeURIComponent(c.req.header("X-Filename") ?? "").replace(/\.[a-z0-9]+$/i, "");
+  const pages = Number(c.req.header("X-Pages")) || null;
+
+  let reading: Awaited<ReturnType<typeof readDocument>> | null = null;
+  let note = "";
+  if (READABLE.includes(type) && buf.byteLength < 20_000_000) {
+    try {
+      reading = await readDocument(c.env, { base64: Buffer.from(buf).toString("base64"), mediaType: type }, { name: item.name, brand: item.brand });
+    } catch (e) {
+      note = `Saved, but the AI couldn't read it: ${errorMessage(e)}`;
+    }
+  } else {
+    note = "Saved. Too large (or not a PDF/photo) for the AI to read.";
+  }
+
+  await c.env.DB.prepare("INSERT INTO documents (id, item_id, kind, title, summary, r2_key, content_type, pages) VALUES (?,?,?,?,?,?,?,?)")
+    .bind(id, item.id, reading?.kind ?? "other", reading?.title || filename || "Document", reading?.summary ?? "", key, type, pages)
+    .run();
+
+  // Fill only what the item doesn't already have; a warranty document overrides an earlier estimate.
+  const filled: string[] = [];
+  if (reading) {
+    const patch: Record<string, unknown> = {};
+    const fill = (col: string, value: unknown, label: string) => {
+      if (!value || (item as Record<string, unknown>)[col]) return;
+      patch[col] = value;
+      filled.push(label);
+    };
+    fill("model", reading.model, "model");
+    fill("serial_number", reading.serial_number, "serial number");
+    fill("purchase_date", reading.purchase_date, "purchase date");
+    fill("purchase_price", reading.purchase_price, "price paid");
+    fill("purchase_store", reading.store, "store");
+    if (reading.warranty_expires && (!(item as Record<string, unknown>).warranty_expires || reading.kind === "warranty")) {
+      patch.warranty_expires = reading.warranty_expires;
+      patch.warranty_note = reading.warranty_note;
+      filled.push("warranty");
+    }
+    await patchItem(c.env, item.id, patch);
+  }
+  const doc = await c.env.DB.prepare("SELECT * FROM documents WHERE id = ?").bind(id).first();
+  return c.json({ item: await getItem(c.env, item.id), document: doc, filled, note });
+});
+
+app.delete("/api/documents/:id", async (c) => {
+  const d = await c.env.DB.prepare("SELECT r2_key FROM documents WHERE id = ?").bind(c.req.param("id")).first<{ r2_key: string }>();
+  if (d) await c.env.PHOTOS.delete(d.r2_key);
+  await c.env.DB.prepare("DELETE FROM documents WHERE id = ?").bind(c.req.param("id")).run();
+  return c.json({ ok: true });
+});
+
+// ---------- voice notes ----------
+
+// Body: a short WAV recording (16 kHz mono, made on the phone). Uses Cloudflare Workers AI (Whisper).
+app.post("/api/transcribe", async (c) => {
+  const buf = await c.req.arrayBuffer();
+  if (!buf.byteLength) return c.json({ error: "No audio" }, 400);
+  if (buf.byteLength > 8_000_000) return c.json({ error: "Recording too long; keep notes under a couple of minutes." }, 400);
+  if (c.env.MOCK_AI === "1") return c.json({ text: "Mock voice note: Fujifilm X100V, bought in 2021 for $1,400, barely used." });
+  try {
+    const r = (await c.env.AI.run("@cf/openai/whisper-large-v3-turbo", {
+      audio: Buffer.from(buf).toString("base64"),
+      language: "en",
+    } as never)) as { text?: string };
+    return c.json({ text: (r.text ?? "").trim() });
+  } catch (e) {
+    return c.json({ error: `Couldn't transcribe: ${errorMessage(e)}` }, 502);
   }
 });
 
@@ -589,13 +690,16 @@ app.get("/api/export.csv", async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT r.name room, i.name, i.category, i.brand, i.description, i.condition, i.size, i.quantity,
             i.replacement_value, i.resale_low, i.resale_high, i.asking_price, i.decision, i.status, i.sold_price,
+            i.model, i.serial_number, i.purchase_date, i.purchase_price, i.purchase_store, i.warranty_expires,
+            (SELECT COUNT(*) FROM documents d WHERE d.item_id = i.id) documents,
             i.image_key, i.created_at
        FROM items i JOIN rooms r ON r.id = i.room_id ORDER BY r.sort_order, i.category, i.name`,
   ).all<Record<string, unknown>>();
   const origin = new URL(c.req.url).origin;
   const cols = [
     "room", "name", "category", "brand", "description", "condition", "size", "quantity",
-    "replacement_value", "resale_low", "resale_high", "asking_price", "decision", "status", "sold_price", "photo_url", "added",
+    "replacement_value", "resale_low", "resale_high", "asking_price", "decision", "status", "sold_price",
+    "model", "serial_number", "purchase_date", "purchase_price", "purchase_store", "warranty_expires", "documents", "photo_url", "added",
   ];
   const esc = (v: unknown) => {
     const s = v === null || v === undefined ? "" : String(v);
@@ -605,6 +709,7 @@ app.get("/api/export.csv", async (c) => {
     [
       r.room, r.name, r.category, r.brand, r.description, r.condition, r.size, r.quantity,
       r.replacement_value, r.resale_low, r.resale_high, r.asking_price, r.decision, r.status, r.sold_price,
+      r.model, r.serial_number, r.purchase_date, r.purchase_price, r.purchase_store, r.warranty_expires, r.documents,
       r.image_key ? `${origin}/img/${r.image_key}` : "", r.created_at,
     ].map(esc).join(","),
   );

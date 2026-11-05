@@ -2,6 +2,7 @@ interface Env {
   DB: D1Database;
   PHOTOS: R2Bucket;
   ASSETS: Fetcher;
+  AI: Ai;
   ANTHROPIC_API_KEY: string;
   APP_PASSCODE: string;
   SESSION_SECRET: string;

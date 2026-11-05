@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
-import { api, ebayItemUrl, imgUrl, type Decision, type EbayStatus, type Item } from "../api";
+import { api, ebayItemUrl, imgUrl, type Decision, type Doc, type EbayStatus, type Item } from "../api";
+import { cleanPage, pagesToPdf, type ScannedPage } from "../lib/scan";
+import { currentValue, daysUntil, fmtDate } from "../lib/value";
 import { go, useStore } from "../store";
 import { DECISION_LABEL, DecisionPill, Icon, Sheet, Topbar, copyText, useToast } from "../ui";
 import { enhance, imagesAsFiles, type EnhanceMode } from "../lib/image";
@@ -163,6 +165,9 @@ export default function ItemDetail({ id }: { id: string }) {
           )}
         </>
       )}
+
+      <OwnershipCard item={item} />
+      <Documents item={item} onItem={upsertItem} />
 
       {item.decision === "sell" && item.status !== "donated" && <SellPanel item={item} save={save} onItem={upsertItem} />}
 
@@ -447,6 +452,226 @@ function Enhancer({ item, onSaved }: { item: Item; onSaved: (i: Item) => void })
   );
 }
 
+function OwnershipCard({ item }: { item: Item }) {
+  const cv = currentValue(item);
+  const days = item.warranty_expires ? daysUntil(item.warranty_expires) : null;
+  const rows: [string, React.ReactNode][] = [];
+  if (item.model) rows.push(["Model", item.model]);
+  if (item.serial_number) rows.push(["Serial", item.serial_number]);
+  if (item.purchase_date || item.purchase_price || item.purchase_store) {
+    rows.push([
+      "Bought",
+      [item.purchase_date && fmtDate(item.purchase_date), item.purchase_store, item.purchase_price ? `${money(item.purchase_price)}${item.quantity > 1 ? " each" : ""}` : ""]
+        .filter(Boolean)
+        .join(" · "),
+    ]);
+  }
+  if (item.warranty_expires) {
+    rows.push([
+      "Warranty",
+      <>
+        {days !== null && days < 0 ? "Ended " : "Until "}
+        {fmtDate(item.warranty_expires)}
+        {days !== null && days >= 0 && days <= 30 && <span className="pill warn" style={{ marginLeft: 6 }}>{days === 0 ? "ends today" : `${days} day${days === 1 ? "" : "s"} left`}</span>}
+        {item.warranty_note && <div className="tiny muted">{item.warranty_note}</div>}
+      </>,
+    ]);
+  }
+  if (cv.depreciated) {
+    rows.push([
+      "Worth today",
+      <>
+        ~{money(cv.value)}{item.quantity > 1 ? " each" : ""}
+        <div className="tiny muted">
+          {cv.lifeYears ? `Paid price, depreciated over a typical ${cv.lifeYears}-year life (${cv.ageYears!.toFixed(1)} years old)` : "Collectible: holds its value"}
+        </div>
+      </>,
+    ]);
+  }
+  if (!rows.length) return null;
+  return (
+    <>
+      <h2>Ownership</h2>
+      <div className="card" style={{ padding: "4px 14px" }}>
+        {rows.map(([l, v]) => (
+          <div className="copyrow" key={l}>
+            <div className="v"><div className="l">{l}</div>{v}</div>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+const DOC_LABEL: Record<Doc["kind"], string> = { receipt: "Receipt", manual: "Manual", warranty: "Warranty", other: "Document" };
+
+function Documents({ item, onItem }: { item: Item; onItem: (i: Item) => void }) {
+  const toast = useToast();
+  const [docs, setDocs] = useState<Doc[] | null>(null);
+  const [busy, setBusy] = useState("");
+  const [scanning, setScanning] = useState(false);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    api.documents(item.id).then(setDocs, () => setDocs([]));
+  }, [item.id]);
+
+  const upload = async (file: Blob, name: string, pages?: number) => {
+    setBusy("Reading it…");
+    setErr("");
+    try {
+      const r = await api.uploadDocument(item.id, file, name, pages);
+      setDocs((d) => [r.document, ...(d ?? [])]);
+      onItem(r.item);
+      const label = DOC_LABEL[r.document.kind];
+      toast(r.note || (r.filled.length ? `${label} saved. Filled in ${r.filled.join(", ")}` : `${label} saved`));
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Upload failed");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  return (
+    <>
+      <h2>Receipts & manuals</h2>
+      {docs && docs.length > 0 && (
+        <div className="card" style={{ padding: "4px 14px", marginBottom: 10 }}>
+          {docs.map((d) => (
+            <div className="copyrow" key={d.id} style={{ alignItems: "center" }}>
+              <Icon name="doc" size={20} />
+              <a className="v grow" href={imgUrl(d.r2_key)} target="_blank" rel="noreferrer" style={{ color: "inherit", textDecoration: "none" }}>
+                <div className="l">{DOC_LABEL[d.kind]}{d.pages ? ` · ${d.pages} page${d.pages === 1 ? "" : "s"}` : ""}</div>
+                {d.title}
+                {d.summary && <div className="tiny muted">{d.summary}</div>}
+              </a>
+              <button
+                className="btn sm ghost"
+                aria-label={`Delete ${d.title}`}
+                onClick={async () => {
+                  if (!confirm(`Delete “${d.title}”?`)) return;
+                  await api.deleteDocument(d.id);
+                  setDocs((all) => (all ?? []).filter((x) => x.id !== d.id));
+                }}
+              >
+                <Icon name="trash" size={16} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="row">
+        <button className="btn grow" onClick={() => setScanning(true)} disabled={!!busy}>
+          <Icon name="scan" size={18} /> Scan pages
+        </button>
+        <label className={`btn grow ${busy ? "disabled" : ""}`}>
+          <Icon name="doc" size={18} /> Add file
+          <input
+            type="file"
+            accept="application/pdf,image/*"
+            hidden
+            disabled={!!busy}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              e.target.value = "";
+              if (f) upload(f, f.name);
+            }}
+          />
+        </label>
+      </div>
+      {busy ? (
+        <p className="tiny muted" style={{ margin: "6px 0 0" }}><span className="spin" /> {busy} Purchase date, price and warranty get filled in automatically.</p>
+      ) : (
+        <p className="tiny muted" style={{ margin: "6px 0 0" }}>Add a receipt or warranty and the AI fills in the purchase date, price and warranty end date.</p>
+      )}
+      {err && <div className="err">{err}</div>}
+      {scanning && (
+        <ScanSheet
+          onClose={() => setScanning(false)}
+          onDone={async (pdf, pages) => {
+            setScanning(false);
+            await upload(pdf, `Scan ${new Date().toLocaleDateString()}`, pages);
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+/** Photograph pages one at a time with the phone camera; they're cleaned up and saved as one PDF. */
+function ScanSheet({ onClose, onDone }: { onClose: () => void; onDone: (pdf: Blob, pages: number) => void }) {
+  const [pages, setPages] = useState<ScannedPage[]>([]);
+  const [working, setWorking] = useState(false);
+  const [err, setErr] = useState("");
+
+  useEffect(() => () => pages.forEach((p) => URL.revokeObjectURL(p.url)), [pages]);
+
+  const add = async (files: FileList | null) => {
+    if (!files?.length) return;
+    setWorking(true);
+    setErr("");
+    try {
+      const cleaned: ScannedPage[] = [];
+      for (const f of Array.from(files)) cleaned.push(await cleanPage(f));
+      setPages((p) => [...p, ...cleaned]);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Couldn't read that photo");
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const pick = (capture: boolean) => (
+    <input
+      type="file"
+      accept="image/*"
+      multiple={!capture}
+      {...(capture ? { capture: "environment" as const } : {})}
+      hidden
+      onChange={(e) => {
+        add(e.target.files);
+        e.target.value = "";
+      }}
+    />
+  );
+
+  return (
+    <Sheet title={pages.length ? `${pages.length} page${pages.length === 1 ? "" : "s"}` : "Scan a document"} onClose={onClose}>
+      <div className="stack">
+        {pages.length > 0 && (
+          <div className="scanpages">
+            {pages.map((p, i) => (
+              <div key={p.url} className="scanpage">
+                <img src={p.url} alt={`Page ${i + 1}`} />
+                <button className="btn sm" aria-label={`Remove page ${i + 1}`} onClick={() => setPages(pages.filter((x) => x !== p))}>
+                  <Icon name="x" size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <p className="tiny muted" style={{ margin: 0 }}>
+          Lay the page flat in good light and fill the frame. Each page is brightened so the paper reads as white.
+        </p>
+        <div className="row">
+          <label className="btn primary grow">
+            {working ? <span className="spin" /> : <Icon name="camera" size={18} />} {pages.length ? "Next page" : "Take first page"}
+            {pick(true)}
+          </label>
+          <label className="btn">
+            <Icon name="image" size={18} />
+            {pick(false)}
+          </label>
+        </div>
+        {err && <div className="err">{err}</div>}
+        <button className="btn lg block" disabled={!pages.length || working} onClick={async () => onDone(await pagesToPdf(pages), pages.length)}>
+          Save {pages.length > 1 ? `${pages.length}-page ` : ""}PDF
+        </button>
+      </div>
+    </Sheet>
+  );
+}
+
 function EditSheet({ item, onClose, onSave }: { item: Item; onClose: () => void; onSave: (p: Partial<Item>) => Promise<void> }) {
   const { rooms } = useStore();
   const [f, setF] = useState({ ...item, tagsText: item.tags.join(", ") });
@@ -466,6 +691,9 @@ function EditSheet({ item, onClose, onSave }: { item: Item; onClose: () => void;
             condition: rest.condition, quantity: Number(rest.quantity), description: rest.description,
             asking_price: Number(rest.asking_price), resale_low: Number(rest.resale_low), resale_high: Number(rest.resale_high),
             replacement_value: Number(rest.replacement_value), listing_title: rest.listing_title,
+            model: rest.model, serial_number: rest.serial_number, purchase_date: rest.purchase_date.trim(),
+            purchase_price: Number(rest.purchase_price) || 0, purchase_store: rest.purchase_store,
+            warranty_expires: rest.warranty_expires,
             listing_description: rest.listing_description, notes: rest.notes,
             tags: tagsText.split(",").map((t) => t.trim()).filter(Boolean),
           });
@@ -505,6 +733,18 @@ function EditSheet({ item, onClose, onSave }: { item: Item; onClose: () => void;
         <div className="two">
           <label className="field"><span>Resale low</span><input className="input" inputMode="decimal" value={f.resale_low} onChange={set("resale_low")} /></label>
           <label className="field"><span>Resale high</span><input className="input" inputMode="decimal" value={f.resale_high} onChange={set("resale_high")} /></label>
+        </div>
+        <div className="two">
+          <label className="field"><span>Model</span><input className="input" value={f.model} onChange={set("model")} /></label>
+          <label className="field"><span>Serial number</span><input className="input" value={f.serial_number} onChange={set("serial_number")} /></label>
+        </div>
+        <div className="two">
+          <label className="field"><span>Bought (YYYY-MM-DD, or just year)</span><input className="input" value={f.purchase_date} placeholder="2021-03" onChange={set("purchase_date")} /></label>
+          <label className="field"><span>Price paid{item.quantity > 1 ? " (each)" : ""}</span><input className="input" inputMode="decimal" value={f.purchase_price || ""} onChange={set("purchase_price")} /></label>
+        </div>
+        <div className="two">
+          <label className="field"><span>Bought at</span><input className="input" value={f.purchase_store} onChange={set("purchase_store")} /></label>
+          <label className="field"><span>Warranty ends</span><input className="input" type="date" value={f.warranty_expires} onChange={set("warranty_expires")} /></label>
         </div>
         <label className="field"><span>Listing title</span><input className="input" maxLength={80} value={f.listing_title} onChange={set("listing_title")} /></label>
         <label className="field"><span>Listing description</span><textarea className="input" value={f.listing_description} onChange={set("listing_description")} /></label>

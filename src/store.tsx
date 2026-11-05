@@ -6,7 +6,7 @@ export interface QueueEntry {
   id: string;
   roomId: string;
   thumb: string;
-  status: "uploading" | "analyzing" | "cropping" | "done" | "error";
+  status: "held" | "uploading" | "analyzing" | "cropping" | "done" | "error";
   itemNames: string[];
   error?: string;
   photoId?: string;
@@ -26,7 +26,9 @@ interface Store {
   upsertItem: (item: Item) => void;
   removeItem: (id: string) => void;
   queue: QueueEntry[];
-  enqueuePhoto: (source: Blob | HTMLCanvasElement, roomId: string, hint: string) => Promise<void>;
+  /** With hold: the photo waits (status "held") until releaseEntry, so a voice note can be attached first. */
+  enqueuePhoto: (source: Blob | HTMLCanvasElement, roomId: string, hint: string, hold?: boolean) => Promise<string>;
+  releaseEntry: (id: string, extraHint?: string) => void;
   retryEntry: (id: string) => void;
   clearDone: () => void;
   setSettings: (s: Settings) => void;
@@ -122,13 +124,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [update, upsertItem]);
 
   const enqueuePhoto = useCallback(
-    async (source: Blob | HTMLCanvasElement, roomId: string, hint: string) => {
+    async (source: Blob | HTMLCanvasElement, roomId: string, hint: string, hold = false) => {
       const { blob, width, height } = await prepareUpload(source);
       const entry: QueueEntry = {
         id: crypto.randomUUID(),
         roomId,
         thumb: URL.createObjectURL(blob),
-        status: "uploading",
+        status: hold ? "held" : "uploading",
         itemNames: [],
         blob,
         width,
@@ -136,6 +138,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         hint,
       };
       queueRef.current = [entry, ...queueRef.current];
+      setQueue(queueRef.current);
+      pump();
+      return entry.id;
+    },
+    [pump],
+  );
+
+  const releaseEntry = useCallback(
+    (id: string, extraHint?: string) => {
+      queueRef.current = queueRef.current.map((e) =>
+        e.id === id && e.status === "held"
+          ? { ...e, status: "uploading" as const, hint: [e.hint, extraHint?.trim()].filter(Boolean).join(". ") }
+          : e,
+      );
       setQueue(queueRef.current);
       pump();
     },
@@ -163,7 +179,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // Warn before closing the tab while photos are still processing.
   useEffect(() => {
-    const busy = queue.some((e) => e.status === "uploading" || e.status === "analyzing");
+    const busy = queue.some((e) => e.status === "held" || e.status === "uploading" || e.status === "analyzing");
     if (!busy) return;
     const h = (ev: BeforeUnloadEvent) => ev.preventDefault();
     window.addEventListener("beforeunload", h);
@@ -173,9 +189,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const value = useMemo(
     () => ({
       rooms, items, settings, loaded, refresh, upsertItem, removeItem,
-      queue, enqueuePhoto, retryEntry, clearDone, setSettings, setRooms,
+      queue, enqueuePhoto, releaseEntry, retryEntry, clearDone, setSettings, setRooms,
     }),
-    [rooms, items, settings, loaded, refresh, upsertItem, removeItem, queue, enqueuePhoto, retryEntry, clearDone],
+    [rooms, items, settings, loaded, refresh, upsertItem, removeItem, queue, enqueuePhoto, releaseEntry, retryEntry, clearDone],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

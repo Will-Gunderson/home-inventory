@@ -45,6 +45,11 @@ export interface DetectedItem {
   listing_description: string;
   tags: string[];
   bbox: { x: number; y: number; w: number; h: number };
+  model: string;
+  serial_number: string;
+  purchase_date: string;
+  purchase_price: number;
+  purchase_store: string;
 }
 
 export interface PhotoAnalysis {
@@ -71,6 +76,7 @@ const ANALYSIS_SCHEMA = {
           "resale_low", "resale_high", "asking_price", "replacement_value",
           "recommendation", "recommendation_reason", "best_platform",
           "listing_title", "listing_description", "tags", "bbox",
+          "model", "serial_number", "purchase_date", "purchase_price", "purchase_store",
         ],
         properties: {
           name: { type: "string", description: "Short specific name, e.g. 'Patagonia Down Sweater Jacket (kids M)'" },
@@ -90,6 +96,11 @@ const ANALYSIS_SCHEMA = {
           listing_title: { type: "string", description: "Marketplace title, max 80 characters, keyword-rich, no emojis" },
           listing_description: { type: "string", description: "3-5 sentence listing body in a friendly, honest voice. Mention condition and size." },
           tags: { type: "array", items: str, description: "3-8 lowercase search keywords" },
+          model: { type: "string", description: "Model name/number if stated in the owner's note or legible on the item, else empty string" },
+          serial_number: { type: "string", description: "Serial number only if stated in the owner's note or legible, else empty string" },
+          purchase_date: { type: "string", description: "When the owner bought it, only if the owner's note says: YYYY-MM-DD, YYYY-MM or YYYY; else empty string" },
+          purchase_price: { ...num, description: "What the owner paid in USD, only if the owner's note says; else 0" },
+          purchase_store: { type: "string", description: "Where the owner bought it, only if the owner's note says; else empty string" },
           bbox: {
             type: "object",
             additionalProperties: false,
@@ -145,7 +156,9 @@ Keep / sell / donate:
 - Otherwise "sell" when the realistic resale high is at or above the owner's sell threshold, and "donate" when it is below (selling isn't worth the hassle).
 - best_platform: "depop" for trendy, branded or vintage clothing and accessories aimed at younger buyers; "ebay" for electronics, collectibles, brand-name items, and anything small and shippable that is worth over about $40; "facebook" for furniture, large or bulky items, kids' gear, toys and everyday household goods; "garage_sale" for low-value items worth selling only in a bundle; "donate" when recommending donation.
 
-Listing copy should be honest, specific and ready to paste.`;
+Listing copy should be honest, specific and ready to paste.
+
+The owner's note (often dictated by voice, so expect transcription slips) is the most reliable source: it can name the exact brand and model, how old something is, what they paid, or its condition. Trust it over what you see, and use it in the name, description and listing copy. Only fill model, serial number and purchase details from the note or from text legible in the photo; never guess them.`;
 
 export async function analyzePhoto(
   env: Env,
@@ -197,8 +210,16 @@ export async function analyzePhoto(
     item.quantity = Math.max(1, Math.round(item.quantity || 1));
     item.bbox = clampBox(item.bbox);
     item.listing_title = item.listing_title.slice(0, 80);
+    item.purchase_date = normDate(item.purchase_date);
+    item.purchase_price = Math.max(0, Number(item.purchase_price) || 0);
   }
   return parsed;
+}
+
+/** Keep YYYY, YYYY-MM or YYYY-MM-DD; anything else becomes "". */
+export function normDate(v: unknown): string {
+  const m = String(v ?? "").trim().match(/^(\d{4})(-(0[1-9]|1[0-2]))?(-(0[1-9]|[12]\d|3[01]))?/);
+  return m ? m[0] : "";
 }
 
 function clampBox(b: { x: number; y: number; w: number; h: number }) {
@@ -424,11 +445,96 @@ Return every REQUIRED specific. Add the others only when the item details make t
   return out;
 }
 
+export interface DocumentReading {
+  kind: "receipt" | "manual" | "warranty" | "other";
+  title: string;
+  summary: string;
+  store: string;
+  purchase_date: string;
+  purchase_price: number;
+  model: string;
+  serial_number: string;
+  warranty_expires: string;
+  warranty_note: string;
+}
+
+/** Read a receipt, manual or warranty (PDF or photo) and pull out purchase and warranty details. */
+export async function readDocument(
+  env: Env,
+  file: { base64: string; mediaType: string },
+  item: { name: string; brand: string },
+): Promise<DocumentReading> {
+  if (env.MOCK_AI === "1") {
+    return {
+      kind: "receipt", title: "Mock receipt", summary: "Mock: bought at Best Buy.", store: "Best Buy",
+      purchase_date: "2024-03-15", purchase_price: 199, model: "", serial_number: "",
+      warranty_expires: new Date(Date.now() + 20 * 86400_000).toISOString().slice(0, 10), warranty_note: "Mock 1-year warranty",
+    };
+  }
+  const source =
+    file.mediaType === "application/pdf"
+      ? ({ type: "document", source: { type: "base64", media_type: "application/pdf", data: file.base64 } } as const)
+      : ({ type: "image", source: { type: "base64", media_type: file.mediaType as "image/jpeg", data: file.base64 } } as const);
+  const today = new Date().toISOString().slice(0, 10);
+
+  const msg = await client(env).beta.messages.create({
+    model: model(env),
+    max_tokens: 4000,
+    betas: ["server-side-fallback-2026-07-01"],
+    fallbacks: "default",
+    output_config: {
+      effort: "low",
+      format: {
+        type: "json_schema",
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["kind", "title", "summary", "store", "purchase_date", "purchase_price", "model", "serial_number", "warranty_expires", "warranty_note"],
+          properties: {
+            kind: { type: "string", enum: ["receipt", "manual", "warranty", "other"] },
+            title: { type: "string", description: "Short name for the document, e.g. 'Best Buy receipt' or 'X100V owner's manual'" },
+            summary: { type: "string", description: "One sentence on what's useful in it" },
+            store: { type: "string", description: "Seller/store on a receipt, else empty" },
+            purchase_date: { type: "string", description: "Purchase date YYYY-MM-DD if shown, else empty" },
+            purchase_price: { ...num, description: "Price paid for this item in USD (the item's line, not the whole receipt if it has other things), else 0" },
+            model: { type: "string", description: "Model name/number if shown, else empty" },
+            serial_number: { type: "string", description: "Serial number if shown, else empty" },
+            warranty_expires: { type: "string", description: "Warranty end date YYYY-MM-DD, else empty" },
+            warranty_note: { type: "string", description: "One short line on the warranty and where the date came from, else empty" },
+          },
+        },
+      },
+    },
+    messages: [
+      {
+        role: "user",
+        content: [
+          source,
+          {
+            type: "text",
+            text: `This document belongs to a household item: "${item.name}"${item.brand ? ` (${item.brand})` : ""}. Today is ${today}.
+
+Read it and fill in what it shows. For warranty_expires: use the warranty terms if the document states them (purchase date + stated length, or a printed end date). If it's a receipt or manual without stated terms but you know the manufacturer's standard warranty for this kind of product with confidence (e.g. Apple: 1 year), compute it from the purchase date and say in warranty_note that it's the standard term, not stated on the document. Otherwise leave it empty. Leave any field empty (or 0) that the document doesn't show; don't guess.`,
+          },
+        ],
+      },
+    ],
+  });
+  const r = JSON.parse(textOf(msg)) as DocumentReading;
+  return {
+    ...r,
+    purchase_date: normDate(r.purchase_date),
+    warranty_expires: /^\d{4}-\d{2}-\d{2}$/.test(r.warranty_expires) ? r.warranty_expires : "",
+    purchase_price: Math.max(0, Number(r.purchase_price) || 0),
+  };
+}
+
 /** Local-dev stand-in so the UI can be exercised without an API key (set MOCK_AI=1 in .dev.vars). */
 function mockAnalysis(ctx: AnalyzeContext): PhotoAnalysis {
   const base = {
     brand: "", size: "", quantity: 1, tags: ["sample"], best_platform: "facebook" as const,
     listing_description: "Sample listing description generated in mock mode.",
+    model: "", serial_number: "", purchase_date: "", purchase_price: 0, purchase_store: "",
   };
   return {
     photo_notes: `Mock analysis for ${ctx.roomName}.`,

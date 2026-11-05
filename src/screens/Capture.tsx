@@ -1,6 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api } from "../api";
 import { go, useRoute, useStore } from "../store";
 import { Icon, Topbar } from "../ui";
+import { startRecording, type Recording } from "../lib/audio";
+
+// How long a new photo waits before uploading, so you can tap the mic and talk about it.
+const HOLD_MS = 4000;
 
 const LAST_ROOM = "hi_last_room";
 const readLast = () => {
@@ -55,11 +60,100 @@ export default function Capture() {
 }
 
 function Camera({ roomId, onRoomChange }: { roomId: string; onRoomChange: (id: string) => void }) {
-  const { rooms, queue, enqueuePhoto, retryEntry } = useStore();
+  const { rooms, queue, enqueuePhoto, releaseEntry, retryEntry } = useStore();
   const videoRef = useRef<HTMLVideoElement>(null);
   const [camError, setCamError] = useState("");
   const [hint, setHint] = useState("");
   const [flash, setFlash] = useState(0);
+
+  // Voice notes. The newest photo is held for HOLD_MS; tapping the mic in that window attaches the
+  // note to it (and keeps it held until the note is transcribed). Otherwise the note goes to the next photo.
+  const held = useRef<{ id: string; timer: number } | null>(null);
+  const waiting = useRef(new Set<string>()); // photos held for a note being recorded/transcribed
+  const recording = useRef<{ rec: Recording; target: string | null } | null>(null);
+  const [voice, setVoice] = useState<"idle" | "recording" | "transcribing">("idle");
+  const [heldNow, setHeldNow] = useState(false);
+  const [voiceMsg, setVoiceMsg] = useState("");
+
+  const releaseHeld = useCallback(() => {
+    if (!held.current) return;
+    clearTimeout(held.current.timer);
+    releaseEntry(held.current.id);
+    held.current = null;
+    setHeldNow(false);
+  }, [releaseEntry]);
+
+  const hold = (id: string) => {
+    releaseHeld();
+    const timer = window.setTimeout(() => {
+      if (held.current?.id === id) releaseHeld();
+    }, HOLD_MS);
+    held.current = { id, timer };
+    setHeldNow(true);
+  };
+
+  // Leaving the camera sends anything still held.
+  useEffect(
+    () => () => {
+      if (held.current) {
+        clearTimeout(held.current.timer);
+        releaseEntry(held.current.id);
+      }
+      recording.current?.rec.cancel();
+      waiting.current.forEach((id) => releaseEntry(id));
+    },
+    [releaseEntry],
+  );
+
+  const stopVoice = async () => {
+    const r = recording.current;
+    if (!r) return;
+    recording.current = null;
+    setVoice("transcribing");
+    let text = "";
+    try {
+      text = (await api.transcribe(await r.rec.stop())).text;
+      setVoiceMsg(text ? `“${text.length > 60 ? text.slice(0, 57) + "…" : text}”` : "Didn't catch that");
+    } catch (e) {
+      setVoiceMsg(e instanceof Error ? e.message : "Couldn't transcribe");
+    }
+    if (r.target) {
+      waiting.current.delete(r.target);
+      releaseEntry(r.target, text);
+    } else if (text) {
+      setHint((h) => [h.trim(), text].filter(Boolean).join(". "));
+    }
+    setVoice("idle");
+    window.setTimeout(() => setVoiceMsg(""), 4000);
+  };
+
+  const toggleVoice = async () => {
+    if (voice === "recording") return stopVoice();
+    if (voice !== "idle") return;
+    let target: string | null = null;
+    if (held.current) {
+      // Claim the held photo: it now waits for this note instead of the timer.
+      target = held.current.id;
+      clearTimeout(held.current.timer);
+      held.current = null;
+      setHeldNow(false);
+      waiting.current.add(target);
+    }
+    try {
+      const rec = await startRecording(() => stopVoice());
+      recording.current = { rec, target };
+      setVoice("recording");
+      setVoiceMsg("");
+      navigator.vibrate?.(10);
+    } catch (e) {
+      if (target) {
+        waiting.current.delete(target);
+        releaseEntry(target);
+      }
+      setVoiceMsg(e instanceof Error && e.name === "NotAllowedError" ? "Microphone access was blocked" : e instanceof Error ? e.message : "Couldn't start recording");
+      window.setTimeout(() => setVoiceMsg(""), 4000);
+    }
+  };
 
   useEffect(() => {
     let stream: MediaStream | null = null;
@@ -98,8 +192,12 @@ function Camera({ roomId, onRoomChange }: { roomId: string; onRoomChange: (id: s
     c.getContext("2d")!.drawImage(v, 0, 0);
     setFlash((f) => f + 1);
     navigator.vibrate?.(15);
-    enqueuePhoto(c, roomId, hint.trim());
+    const note = hint.trim();
     setHint("");
+    // While a note is being recorded, the next photo uploads right away; otherwise hold it for a note.
+    const holdIt = voice === "idle";
+    if (!holdIt) releaseHeld();
+    enqueuePhoto(c, roomId, note, holdIt).then((id) => holdIt && hold(id));
   };
 
   const fromLibrary = (files: FileList | null) => {
@@ -110,7 +208,7 @@ function Camera({ roomId, onRoomChange }: { roomId: string; onRoomChange: (id: s
 
   const mine = queue;
   const found = mine.reduce((s, q) => s + q.itemNames.length, 0);
-  const working = mine.filter((q) => q.status === "uploading" || q.status === "analyzing").length;
+  const working = mine.filter((q) => q.status === "held" || q.status === "uploading" || q.status === "analyzing").length;
   const last = mine[0];
 
   return (
@@ -139,9 +237,19 @@ function Camera({ roomId, onRoomChange }: { roomId: string; onRoomChange: (id: s
       </div>
 
       <div className="bottom" style={{ position: "relative" }}>
-        {last && (
+        {(last || voice !== "idle" || voiceMsg) && (
           <div className="toast-cap">
-            {working
+            {voice === "recording"
+              ? "Listening… tap the mic when you're done"
+              : voice === "transcribing"
+                ? "Writing down your note…"
+                : voiceMsg
+                  ? voiceMsg
+                  : heldNow
+                    ? "Tap the mic to describe it"
+                    : !last
+                      ? ""
+                      : working
               ? `Identifying ${working} photo${working === 1 ? "" : "s"}… keep shooting`
               : last.status === "error"
                 ? "A photo failed. Tap it to retry"
@@ -159,19 +267,29 @@ function Camera({ roomId, onRoomChange }: { roomId: string; onRoomChange: (id: s
               >
                 <img src={q.thumb} alt="" />
                 <div className="st">
-                  {q.status === "done" ? q.itemNames.length : q.status === "error" ? "!" : <span className="spin" />}
+                  {q.status === "done" ? q.itemNames.length : q.status === "error" ? "!" : q.status === "held" ? <Icon name="mic" size={16} /> : <span className="spin" />}
                 </div>
               </div>
             ))}
           </div>
         )}
-        <input
-          className="hint"
-          placeholder="Optional note, e.g. “barely worn, size 8”"
-          value={hint}
-          onChange={(e) => setHint(e.target.value)}
-          enterKeyHint="done"
-        />
+        <div className="hintrow">
+          <input
+            className="hint"
+            placeholder={heldNow ? "Tap the mic to describe this photo" : "Note for the next photo, or tap the mic"}
+            value={hint}
+            onChange={(e) => setHint(e.target.value)}
+            enterKeyHint="done"
+          />
+          <button
+            className={`mic ${voice} ${heldNow ? "ready" : ""}`}
+            onClick={toggleVoice}
+            disabled={voice === "transcribing"}
+            aria-label={voice === "recording" ? "Stop recording" : heldNow ? "Describe this photo by voice" : "Voice note for the next photo"}
+          >
+            {voice === "transcribing" ? <span className="spin" /> : <Icon name={voice === "recording" ? "stop" : "mic"} size={20} />}
+          </button>
+        </div>
         <div className="controls">
           <label className="lib">
             <Icon name="image" />
