@@ -52,6 +52,8 @@ export interface Item {
   notes: string;
   ebay_offer_id: string | null;
   ebay_listing_id: string | null;
+  ebay_listed_at: string | null;
+  ebay_price_dropped: number;
   created_at: string;
   updated_at: string;
 }

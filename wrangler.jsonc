@@ -23,5 +23,7 @@
   },
   // Requires willgunderson.com to be a zone on your Cloudflare account.
   "routes": [{ "pattern": "home.willgunderson.com", "custom_domain": true }],
+  // Hourly eBay sync: mark items sold, drop prices on listings unsold after 14 days.
+  "triggers": { "crons": ["17 * * * *"] },
   "observability": { "enabled": true }
 }

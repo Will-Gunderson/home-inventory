@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { Buffer } from "node:buffer";
 import Anthropic from "@anthropic-ai/sdk";
 import { checkPasscode, clearCookie, hmac, isAuthed, sessionCookie } from "./auth";
-import { EbayError, authorizeUrl, disconnect, ebayConfigured, ebayStatus, endListing, exchangeCode, publishListing } from "./ebay";
+import { EbayError, authorizeUrl, disconnect, ebayConfigured, ebayCron, ebayStatus, endListing, exchangeCode, publishListing } from "./ebay";
 import { AiError, analyzePhoto, researchPrice, writeBundlePost, CATEGORIES, CONDITIONS, DECISIONS } from "./ai";
 
 type App = { Bindings: Env };
@@ -345,7 +345,18 @@ const EDITABLE: Record<string, (v: unknown) => unknown> = {
   notes: String,
 };
 
+// Ending a live eBay listing when the item is gone some other way, so it can't sell twice.
+async function endEbayIfLive(env: Env, id: string) {
+  const row = await env.DB.prepare("SELECT ebay_offer_id, ebay_listing_id, status FROM items WHERE id = ?")
+    .bind(id)
+    .first<{ ebay_offer_id: string | null; ebay_listing_id: string | null; status: string }>();
+  if (!row?.ebay_offer_id || !row.ebay_listing_id || row.status === "sold") return;
+  await endListing(env, row.ebay_offer_id).catch((e) => console.error("ending eBay listing failed", id, e));
+  await env.DB.prepare("UPDATE items SET ebay_listing_id = NULL WHERE id = ?").bind(id).run();
+}
+
 async function patchItem(env: Env, id: string, body: Record<string, unknown>) {
+  if (body.status === "sold" || body.status === "donated") await endEbayIfLive(env, id);
   const sets: string[] = [];
   const vals: unknown[] = [];
   for (const [k, v] of Object.entries(body)) {
@@ -383,6 +394,7 @@ async function deleteItemFiles(env: Env, item: { image_key?: unknown; enhanced_k
 app.delete("/api/items/:id", async (c) => {
   const item = await getItem(c.env, c.req.param("id"));
   if (!item) return c.json({ ok: true });
+  await endEbayIfLive(c.env, item.id);
   await deleteItemFiles(c.env, item);
   await c.env.DB.prepare("DELETE FROM items WHERE id = ?").bind(c.req.param("id")).run();
   return c.json({ ok: true });
@@ -537,9 +549,16 @@ app.post("/api/items/:id/ebay", async (c) => {
     );
     const listedOn = item.listed_on as string[];
     await c.env.DB.prepare(
-      "UPDATE items SET ebay_offer_id=?, ebay_listing_id=?, status=CASE WHEN status='active' THEN 'listed' ELSE status END, decision='sell', decision_confirmed=1, listed_on=?, updated_at=? WHERE id=?",
+      `UPDATE items SET ebay_offer_id=?, ebay_listing_id=?, status=CASE WHEN status='active' THEN 'listed' ELSE status END,
+         decision='sell', decision_confirmed=1, listed_on=?, updated_at=?,
+         ebay_listed_at=CASE WHEN ? THEN ebay_listed_at ELSE ? END,
+         ebay_price_dropped=CASE WHEN ? THEN ebay_price_dropped ELSE 0 END
+       WHERE id=?`,
     )
-      .bind(r.offerId, r.listingId, JSON.stringify(listedOn.includes("ebay") ? listedOn : [...listedOn, "ebay"]), now(), item.id)
+      .bind(
+        r.offerId, r.listingId, JSON.stringify(listedOn.includes("ebay") ? listedOn : [...listedOn, "ebay"]), now(),
+        r.revised ? 1 : 0, now(), r.revised ? 1 : 0, item.id,
+      )
       .run();
     return c.json({ item: await getItem(c.env, item.id), url: r.url, category: r.category });
   } catch (e) {
@@ -599,4 +618,10 @@ app.get("/api/export.csv", async (c) => {
 
 app.all("/api/*", (c) => c.json({ error: "Not found" }, 404));
 
-export default app;
+export default {
+  fetch: app.fetch,
+  // Hourly (see wrangler.jsonc): record eBay sales, drop prices on stale listings.
+  async scheduled(_event, env, ctx) {
+    ctx.waitUntil(ebayCron(env));
+  },
+} satisfies ExportedHandler<Env>;

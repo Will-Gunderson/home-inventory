@@ -16,7 +16,15 @@ const SCOPES = [
   "https://api.ebay.com/oauth/api_scope",
   "https://api.ebay.com/oauth/api_scope/sell.inventory",
   "https://api.ebay.com/oauth/api_scope/sell.account",
+  "https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly",
 ].join(" ");
+
+// Best Offer: auto-accept at 90% of the price or more, auto-decline below 70%.
+const AUTO_ACCEPT = 0.9;
+const AUTO_DECLINE = 0.7;
+// Unsold after this many days → drop the price once by PRICE_DROP.
+const PRICE_DROP_DAYS = 14;
+const PRICE_DROP = 0.1;
 
 export class EbayError extends Error {}
 
@@ -353,6 +361,26 @@ export interface ListingInput {
   imageUrls: string[];
 }
 
+const usd = (n: number) => ({ value: n.toFixed(2), currency: "USD" });
+
+function bestOfferTerms(price: number) {
+  return {
+    bestOfferEnabled: true,
+    autoAcceptPrice: usd(Math.floor(price * AUTO_ACCEPT * 100) / 100),
+    autoDeclinePrice: usd(Math.floor(price * AUTO_DECLINE * 100) / 100),
+  };
+}
+
+// Some categories don't allow Best Offer; retry those without it.
+async function withBestOffer<T>(send: (bestOffer: boolean) => Promise<T>): Promise<T> {
+  try {
+    return await send(true);
+  } catch (e) {
+    if (e instanceof EbayApiError && /best ?offer/i.test(e.message)) return send(false);
+    throw e;
+  }
+}
+
 const escapeHtml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 export async function publishListing(env: Env, item: ListingInput, postalCode: string) {
@@ -394,9 +422,11 @@ export async function publishListing(env: Env, item: ListingInput, postalCode: s
       paymentPolicyId: setup.paymentPolicyId,
       returnPolicyId: setup.returnPolicyId,
     },
-    pricingSummary: { price: { value: item.price.toFixed(2), currency: "USD" } },
+    pricingSummary: { price: usd(item.price) },
     merchantLocationKey: LOCATION_KEY,
   };
+  const body = (bestOffer: boolean) =>
+    bestOffer ? { ...offerBody, listingPolicies: { ...offerBody.listingPolicies, bestOfferTerms: bestOfferTerms(item.price) } } : offerBody;
 
   const existing = await call<{ offers?: { offerId: string; status: string; listing?: { listingId?: string } }[] }>(
     env, token, "GET", `/sell/inventory/v1/offer?sku=${encodeURIComponent(item.sku)}&marketplace_id=${MARKETPLACE}`,
@@ -407,19 +437,135 @@ export async function publishListing(env: Env, item: ListingInput, postalCode: s
   if (offer) {
     offerId = offer.offerId;
     // Updating a live offer revises the eBay listing in place.
-    await call(env, token, "PUT", `/sell/inventory/v1/offer/${offerId}`, offerBody);
+    await withBestOffer((bo) => call(env, token, "PUT", `/sell/inventory/v1/offer/${offerId}`, body(bo)));
     if (offer.status === "PUBLISHED" && offer.listing?.listingId) {
-      return { offerId, listingId: offer.listing.listingId, url: listingUrl(env, offer.listing.listingId), category: category.path };
+      const listingId = offer.listing.listingId;
+      return { offerId, listingId, url: listingUrl(env, listingId), category: category.path, revised: true };
     }
   } else {
-    offerId = (await call<{ offerId: string }>(env, token, "POST", "/sell/inventory/v1/offer", offerBody)).offerId;
+    offerId = (await withBestOffer((bo) => call<{ offerId: string }>(env, token, "POST", "/sell/inventory/v1/offer", body(bo)))).offerId;
   }
 
   const { listingId } = await call<{ listingId: string }>(env, token, "POST", `/sell/inventory/v1/offer/${offerId}/publish`);
-  return { offerId, listingId, url: listingUrl(env, listingId), category: category.path };
+  return { offerId, listingId, url: listingUrl(env, listingId), category: category.path, revised: false };
 }
 
 export async function endListing(env: Env, offerId: string) {
   const token = await userToken(env);
   await call(env, token, "POST", `/sell/inventory/v1/offer/${offerId}/withdraw`);
+}
+
+// ---------- hourly automation (cron) ----------
+
+const sqlNow = () => new Date().toISOString().replace("T", " ").slice(0, 19);
+
+/** Record eBay sales and mark items sold once every unit is gone. Safe to run repeatedly. */
+export async function syncSales(env: Env) {
+  const token = await userToken(env);
+  const s = await getKeys(env, ["ebay_sales_checked"]);
+  // Look back from the last check (with a day of overlap), or 30 days the first time.
+  const since = new Date(Math.max(Number(s.ebay_sales_checked || 0) - 86400_000, Date.now() - 30 * 86400_000));
+  const started = Date.now();
+
+  type Order = {
+    orderId: string;
+    creationDate: string;
+    orderPaymentStatus: string;
+    cancelStatus?: { cancelState?: string };
+    lineItems: { lineItemId: string; sku?: string; quantity: number; lineItemCost?: { value: string } }[];
+  };
+  const touched = new Set<string>();
+  let path: string | null = `/sell/fulfillment/v1/order?limit=200&filter=${encodeURIComponent(`creationdate:[${since.toISOString()}..]`)}`;
+  while (path) {
+    const page: { orders?: Order[]; next?: string } = await call(env, token, "GET", path);
+    for (const o of page.orders ?? []) {
+      if (o.cancelStatus?.cancelState === "CANCELED") continue;
+      if (!["PAID", "PARTIALLY_REFUNDED"].includes(o.orderPaymentStatus)) continue;
+      for (const li of o.lineItems) {
+        if (!li.sku) continue;
+        const exists = await env.DB.prepare("SELECT 1 FROM items WHERE id = ?").bind(li.sku).first();
+        if (!exists) continue;
+        await env.DB.prepare(
+          "INSERT OR IGNORE INTO ebay_sales (line_item_id, order_id, item_id, quantity, amount, sold_at) VALUES (?,?,?,?,?,?)",
+        )
+          .bind(li.lineItemId, o.orderId, li.sku, li.quantity || 1, Number(li.lineItemCost?.value) || 0, o.creationDate)
+          .run();
+        touched.add(li.sku);
+      }
+    }
+    path = page.next ? page.next.replace(/^https:\/\/[^/]+/, "") : null;
+  }
+
+  for (const id of touched) {
+    await env.DB.prepare(
+      `UPDATE items SET
+         sold_price = (SELECT SUM(amount) FROM ebay_sales WHERE item_id = items.id),
+         status = CASE WHEN (SELECT SUM(quantity) FROM ebay_sales WHERE item_id = items.id) >= quantity THEN 'sold' ELSE status END,
+         decision = 'sell', decision_confirmed = 1, updated_at = ?
+       WHERE id = ?`,
+    )
+      .bind(sqlNow(), id)
+      .run();
+  }
+  await setKeys(env, { ebay_sales_checked: String(started) });
+  return touched.size;
+}
+
+/** Drop the price once on eBay listings that haven't sold after PRICE_DROP_DAYS. */
+export async function dropStalePrices(env: Env) {
+  const { results } = await env.DB.prepare(
+    `SELECT id, asking_price, resale_high, ebay_offer_id FROM items
+      WHERE status = 'listed' AND ebay_listing_id IS NOT NULL AND ebay_offer_id IS NOT NULL
+        AND ebay_price_dropped = 0 AND ebay_listed_at < datetime('now', ?)`,
+  )
+    .bind(`-${PRICE_DROP_DAYS} days`)
+    .all<{ id: string; asking_price: number; resale_high: number; ebay_offer_id: string }>();
+  if (!results.length) return 0;
+  const token = await userToken(env);
+  let dropped = 0;
+  for (const it of results) {
+    const price = Math.max(1, Math.round((it.asking_price || it.resale_high) * (1 - PRICE_DROP)));
+    try {
+      const o = await call<Record<string, any>>(env, token, "GET", `/sell/inventory/v1/offer/${it.ebay_offer_id}`);
+      const base = {
+        sku: o.sku,
+        marketplaceId: o.marketplaceId,
+        format: o.format,
+        availableQuantity: o.availableQuantity,
+        categoryId: o.categoryId,
+        listingDescription: o.listingDescription,
+        merchantLocationKey: o.merchantLocationKey,
+        pricingSummary: { price: usd(price) },
+      };
+      const { bestOfferTerms: _old, ...policies } = o.listingPolicies ?? {};
+      await withBestOffer((bo) =>
+        call(env, token, "PUT", `/sell/inventory/v1/offer/${it.ebay_offer_id}`, {
+          ...base,
+          listingPolicies: bo ? { ...policies, bestOfferTerms: bestOfferTerms(price) } : policies,
+        }),
+      );
+      await env.DB.prepare("UPDATE items SET asking_price = ?, ebay_price_dropped = 1, updated_at = ? WHERE id = ?")
+        .bind(price, sqlNow(), it.id)
+        .run();
+      dropped++;
+    } catch (e) {
+      console.error("price drop failed", it.id, e);
+    }
+  }
+  return dropped;
+}
+
+/** Cron entry point: does nothing until an eBay account is connected. */
+export async function ebayCron(env: Env) {
+  if (!ebayConfigured(env) || !(await ebayStatus(env)).connected) return;
+  try {
+    await syncSales(env);
+  } catch (e) {
+    console.error("eBay sales sync failed", e);
+  }
+  try {
+    await dropStalePrices(env);
+  } catch (e) {
+    console.error("eBay price drop failed", e);
+  }
 }

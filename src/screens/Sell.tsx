@@ -1,7 +1,8 @@
-import { useMemo, useState } from "react";
-import { api, type Item } from "../api";
+import { useEffect, useMemo, useState } from "react";
+import { api, type EbayStatus, type Item } from "../api";
 import { go, useStore } from "../store";
-import { Icon, ItemTile, Topbar, useToast } from "../ui";
+import { Icon, ItemTile, Sheet, Topbar, useToast } from "../ui";
+import { EBAY_AUTOMATION_NOTE, ebayStatus, postToEbay } from "../lib/ebay";
 import { money, price } from "../lib/listing";
 import BundleSheet from "./Bundle";
 
@@ -14,6 +15,11 @@ export default function Sell() {
   const [selecting, setSelecting] = useState(false);
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [bundle, setBundle] = useState(false);
+  const [ebayBulk, setEbayBulk] = useState(false);
+  const [ebay, setEbay] = useState<EbayStatus | null>(null);
+  useEffect(() => {
+    ebayStatus().then(setEbay);
+  }, []);
 
   const groups = useMemo(() => {
     const by = (f: (i: Item) => boolean) => items.filter(f);
@@ -126,11 +132,22 @@ export default function Sell() {
               {sel.size === shown.length ? "None" : "All"}
             </button>
             <span className="grow" />
+            {ebay?.connected && (
+              <button className="btn sm" disabled={!sel.size} onClick={() => setEbayBulk(true)}>
+                <Icon name="tag" size={16} /> eBay
+              </button>
+            )}
             <button className="btn sm primary" disabled={!sel.size} onClick={() => setBundle(true)}>
               <Icon name="sparkle" size={16} /> Post together
             </button>
           </div>
         </div>
+      )}
+      {ebayBulk && (
+        <EbayBulkSheet
+          items={items.filter((i) => sel.has(i.id))}
+          onClose={() => { setEbayBulk(false); setSelecting(false); setSel(new Set()); }}
+        />
       )}
       {bundle && (
         <BundleSheet
@@ -139,5 +156,76 @@ export default function Sell() {
         />
       )}
     </>
+  );
+}
+
+type Result = { state: "waiting" | "working" | "done" | "error" | "skipped"; msg: string };
+
+/** Posts each selected item to eBay as its own listing, two at a time. */
+function EbayBulkSheet({ items, onClose }: { items: Item[]; onClose: () => void }) {
+  const { upsertItem } = useStore();
+  const toast = useToast();
+  const [results, setResults] = useState<Record<string, Result>>({});
+  const [running, setRunning] = useState(false);
+  const todo = items.filter((i) => !i.ebay_listing_id && i.status !== "sold");
+  const already = items.length - todo.length;
+  const finished = Object.values(results).filter((r) => r.state === "done" || r.state === "error").length;
+
+  const set = (id: string, r: Result) => setResults((all) => ({ ...all, [id]: r }));
+
+  const run = async () => {
+    setRunning(true);
+    setResults(Object.fromEntries(todo.map((i) => [i.id, { state: "waiting", msg: "Waiting" } as Result])));
+    const queue = [...todo];
+    let ok = 0;
+    const worker = async () => {
+      for (let item = queue.shift(); item; item = queue.shift()) {
+        const id = item.id;
+        set(id, { state: "working", msg: "Starting…" });
+        try {
+          await postToEbay(item, upsertItem, (msg) => set(id, { state: "working", msg }));
+          set(id, { state: "done", msg: "Live on eBay" });
+          ok++;
+        } catch (e) {
+          set(id, { state: "error", msg: e instanceof Error ? e.message : "Failed" });
+        }
+      }
+    };
+    await Promise.all([worker(), worker()]);
+    setRunning(false);
+    toast(`${ok} of ${todo.length} posted to eBay`);
+  };
+
+  return (
+    <Sheet title={`Post ${todo.length} item${todo.length === 1 ? "" : "s"} to eBay`} onClose={() => !running && onClose()}>
+      <div className="stack">
+        {already > 0 && <p className="small muted" style={{ margin: 0 }}>{already} already on eBay or sold; skipping.</p>}
+        <div className="card" style={{ padding: "4px 14px" }}>
+          {todo.map((i) => {
+            const r = results[i.id];
+            return (
+              <div className="copyrow" key={i.id} style={{ alignItems: "center" }}>
+                <div className="v">
+                  <div style={{ fontWeight: 600 }}>{i.listing_title || i.name}</div>
+                  {r && <div className={r.state === "error" ? "err" : "tiny muted"}>{r.msg}</div>}
+                </div>
+                {r?.state === "working" && <span className="spin" />}
+                {r?.state === "done" && <Icon name="check" size={18} />}
+              </div>
+            );
+          })}
+        </div>
+        {!running && finished === 0 && (
+          <>
+            <p className="tiny muted" style={{ margin: 0 }}>Each item gets its own listing at its asking price. {EBAY_AUTOMATION_NOTE}</p>
+            <button className="btn primary lg block" disabled={!todo.length} onClick={run}>
+              <Icon name="tag" size={18} /> Post {todo.length} to eBay
+            </button>
+          </>
+        )}
+        {running && <p className="tiny muted" style={{ margin: 0 }}>{finished} of {todo.length} done. Keep this screen open.</p>}
+        {!running && finished > 0 && <button className="btn block" onClick={onClose}>Done</button>}
+      </div>
+    </Sheet>
   );
 }

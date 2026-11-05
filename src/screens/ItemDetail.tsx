@@ -3,6 +3,7 @@ import { api, ebayItemUrl, imgUrl, type Decision, type EbayStatus, type Item } f
 import { go, useStore } from "../store";
 import { DECISION_LABEL, DecisionPill, Icon, Sheet, Topbar, copyText, useToast } from "../ui";
 import { enhance, imagesAsFiles, type EnhanceMode } from "../lib/image";
+import { EBAY_AUTOMATION_NOTE, ebayStatus, postToEbay } from "../lib/ebay";
 import { CONDITION_LABEL, PLATFORM_INFO, listingFields, listingText, money, price, range, suggestedPlatform, type SellPlatform } from "../lib/listing";
 
 const CATEGORIES = [
@@ -278,7 +279,10 @@ function SellPanel({ item, save, onItem }: { item: Item; save: (p: Partial<Item>
             <button
               className="btn primary lg block"
               onClick={async () => {
-                await save({ status: "sold", sold_price: Number(soldPrice) || 0, decision_confirmed: true }, "Nice! Marked sold");
+                await save(
+                  { status: "sold", sold_price: Number(soldPrice) || 0, decision_confirmed: true },
+                  item.ebay_listing_id ? "Marked sold and ended the eBay listing" : "Nice! Marked sold",
+                );
                 setSoldOpen(false);
               }}
             >
@@ -291,17 +295,15 @@ function SellPanel({ item, save, onItem }: { item: Item; save: (p: Partial<Item>
   );
 }
 
-let ebayStatusCache: Promise<EbayStatus | null> | null = null;
-
 function EbayPost({ item, onItem }: { item: Item; onItem: (i: Item) => void }) {
   const toast = useToast();
   const [status, setStatus] = useState<EbayStatus | null>(null);
   const [busy, setBusy] = useState<"post" | "end" | null>(null);
+  const [step, setStep] = useState("");
   const [err, setErr] = useState("");
 
   useEffect(() => {
-    ebayStatusCache ??= api.ebayStatus().catch(() => null);
-    ebayStatusCache.then(setStatus);
+    ebayStatus().then(setStatus);
   }, []);
 
   if (!status?.configured) return null;
@@ -317,8 +319,7 @@ function EbayPost({ item, onItem }: { item: Item; onItem: (i: Item) => void }) {
     setBusy("post");
     setErr("");
     try {
-      const r = await api.postToEbay(item.id);
-      onItem(r.item);
+      await postToEbay(item, onItem, setStep);
       toast(item.ebay_listing_id ? "eBay listing updated" : "Live on eBay!");
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Couldn't post to eBay");
@@ -341,6 +342,9 @@ function EbayPost({ item, onItem }: { item: Item; onItem: (i: Item) => void }) {
     }
   };
 
+  const live = item.ebay_listing_id && item.status !== "sold";
+  const listedOn = item.ebay_listed_at ? new Date(item.ebay_listed_at.replace(" ", "T") + "Z").toLocaleDateString() : "";
+
   return (
     <div className="stack" style={{ marginBottom: 12 }}>
       {item.ebay_listing_id ? (
@@ -348,19 +352,30 @@ function EbayPost({ item, onItem }: { item: Item; onItem: (i: Item) => void }) {
           <a className="btn primary grow" href={ebayItemUrl(item, status.sandbox)} target="_blank" rel="noreferrer">
             <Icon name="external" size={18} /> View on eBay
           </a>
-          <button className="btn" onClick={post} disabled={!!busy} title="Push your latest edits to eBay">
-            {busy === "post" ? <span className="spin" /> : "Update"}
-          </button>
-          <button className="btn danger" onClick={end} disabled={!!busy}>
-            {busy === "end" ? <span className="spin" /> : "End"}
-          </button>
+          {live && (
+            <>
+              <button className="btn" onClick={post} disabled={!!busy} title="Push your latest edits to eBay">
+                {busy === "post" ? <span className="spin" /> : "Update"}
+              </button>
+              <button className="btn danger" onClick={end} disabled={!!busy}>
+                {busy === "end" ? <span className="spin" /> : "End"}
+              </button>
+            </>
+          )}
         </div>
-      ) : (
+      ) : item.status !== "sold" ? (
         <button className="btn primary lg block" onClick={post} disabled={!!busy}>
-          {busy === "post" ? <><span className="spin" /> Posting to eBay…</> : <><Icon name="tag" size={18} /> Post to eBay for ${price(item)}</>}
+          {busy === "post" ? <><span className="spin" /> {step || "Posting to eBay…"}</> : <><Icon name="tag" size={18} /> Post to eBay for ${price(item)}</>}
         </button>
+      ) : null}
+      {busy === "post" && <p className="tiny muted" style={{ margin: 0 }}>Takes about 10–30 seconds. Keep this screen open.</p>}
+      {live && !busy && (
+        <p className="tiny muted" style={{ margin: 0 }}>
+          {listedOn && <>Listed {listedOn}. </>}
+          {item.ebay_price_dropped ? "Price already dropped 10%. " : ""}
+          {EBAY_AUTOMATION_NOTE} Sales are marked here automatically.
+        </p>
       )}
-      {busy === "post" && <p className="tiny muted" style={{ margin: 0 }}>Picking a category and filling in item specifics. About 10–20 seconds.</p>}
       {err && <div className="err">{err}</div>}
     </div>
   );

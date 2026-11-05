@@ -13,7 +13,11 @@ A personal app at **home.willgunderson.com** for photographing everything in the
 7. **Real prices.** "Check prices against real listings" uses Claude with web search to find comparable sold listings and update the price.
 8. **Insurance.** Settings → Export downloads a CSV of every item with room, condition, replacement value and a photo link.
 
-9. **One-tap eBay.** Connect your eBay account once in Settings, then **Post to eBay** on any item's eBay tab. The app picks the eBay category, fills in the required item specifics (brand, size, color…) with Claude, uploads the photos and publishes a fixed-price listing using your eBay shipping/payment/return policies. **Update** pushes later edits to the live listing; **End** takes it down.
+9. **One-tap eBay.** Connect your eBay account once in Settings, then **Post to eBay** on any item's eBay tab. The app picks the eBay category, fills in the required item specifics (brand, size, color…) with Claude, uploads the photos and publishes a fixed-price listing using your eBay shipping/payment/return policies. **Update** pushes later edits to the live listing; **End** takes it down. Or select several items on the Sell screen and tap **eBay** to list them all.
+   - Items with a cropped photo but no cleaned-up one get **Cut out item** applied automatically before posting.
+   - Every listing takes **Best Offer**: offers at 90%+ of the price are accepted automatically, under 70% declined.
+   - **Hourly sync:** eBay sales are recorded and the item is marked sold with the real sale price. A listing still unsold after **14 days** drops its price 10%, once.
+   - Marking an item sold or donated in the app (or deleting it) **ends its eBay listing**, so nothing sells twice.
 
 Why Facebook Marketplace and Depop are copy-and-paste: neither offers a public API for posting listings, so the app gets everything ready and you paste it in (about 20 seconds per item).
 
