@@ -13,7 +13,23 @@ A personal app at **home.willgunderson.com** for photographing everything in the
 7. **Real prices.** "Check prices against real listings" uses Claude with web search to find comparable sold listings and update the price.
 8. **Insurance.** Settings → Export downloads a CSV of every item with room, condition, replacement value and a photo link.
 
-Why Facebook Marketplace and Depop are copy-and-paste: neither offers a public API for posting listings, so the app gets everything ready and you paste it in (about 20 seconds per item). eBay does have a listing API; posting to eBay directly is a possible next step (see below).
+9. **One-tap eBay.** Connect your eBay account once in Settings, then **Post to eBay** on any item's eBay tab. The app picks the eBay category, fills in the required item specifics (brand, size, color…) with Claude, uploads the photos and publishes a fixed-price listing using your eBay shipping/payment/return policies. **Update** pushes later edits to the live listing; **End** takes it down.
+
+Why Facebook Marketplace and Depop are copy-and-paste: neither offers a public API for posting listings, so the app gets everything ready and you paste it in (about 20 seconds per item).
+
+### eBay setup (once)
+
+1. At [developer.ebay.com](https://developer.ebay.com) create an app and open its **Production** keyset.
+2. Under **User Tokens → Get a Token from eBay via Your Application**, add an eBay redirect URL (RuName). Set its **auth accepted URL** and **auth declined URL** to `https://home.willgunderson.com/api/ebay/callback`. Copy the RuName (looks like `Will_Gunderson-WillGund-home-i-abcdefg`).
+3. Save the secrets:
+   ```bash
+   npx wrangler secret put EBAY_CLIENT_ID       # App ID
+   npx wrangler secret put EBAY_CLIENT_SECRET   # Cert ID
+   npx wrangler secret put EBAY_RU_NAME         # the RuName from step 2
+   ```
+4. In the app: Settings → eBay → enter your ship-from ZIP → **Connect eBay account**.
+
+The first post uses your default eBay business policies. If you have none, it creates simple ones (USPS Ground Advantage, $8.95 flat; immediate payment; no returns) that you can edit on eBay. Listing photos are served to eBay from signed, unguessable `/pub/…` links. Set `EBAY_ENV=sandbox` (as a var) to test against eBay's sandbox with a sandbox keyset.
 
 ## Stack
 
@@ -61,7 +77,6 @@ The live camera needs HTTPS (or localhost). To test on your phone against a dev 
 
 ## Ideas for later
 
-- Post to eBay directly through the eBay Sell API (OAuth + Inventory API)
 - Multi-user households and accounts (the step toward a product)
 - Receipts and serial numbers attached to high-value items, for insurance claims
 - "Not used in 6 months" nudges: re-photograph a room later and flag items that haven't moved

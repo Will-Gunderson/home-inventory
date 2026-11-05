@@ -1,7 +1,8 @@
 import { Hono } from "hono";
 import { Buffer } from "node:buffer";
 import Anthropic from "@anthropic-ai/sdk";
-import { checkPasscode, clearCookie, isAuthed, sessionCookie } from "./auth";
+import { checkPasscode, clearCookie, hmac, isAuthed, sessionCookie } from "./auth";
+import { EbayError, authorizeUrl, disconnect, ebayConfigured, ebayStatus, endListing, exchangeCode, publishListing } from "./ebay";
 import { AiError, analyzePhoto, researchPrice, writeBundlePost, CATEGORIES, CONDITIONS, DECISIONS } from "./ai";
 
 type App = { Bindings: Env };
@@ -18,6 +19,7 @@ async function getSettings(env: Env) {
     location: map.location ?? "",
     sell_threshold: Number(map.sell_threshold ?? 20) || 20,
     household_notes: map.household_notes ?? "",
+    ebay_postal_code: map.ebay_postal_code ?? "",
   };
 }
 
@@ -36,6 +38,10 @@ type ItemRow = {
   asking_price: number;
   image_key: string | null;
   enhanced_key: string | null;
+  listing_title: string;
+  listing_description: string;
+  ebay_offer_id: string | null;
+  ebay_listing_id: string | null;
   [col: string]: unknown;
   tags: string;
   bbox: string | null;
@@ -68,7 +74,7 @@ async function getItem(env: Env, id: string) {
 }
 
 function errorMessage(e: unknown): string {
-  if (e instanceof AiError) return e.message;
+  if (e instanceof AiError || e instanceof EbayError) return e.message;
   if (e instanceof Anthropic.AuthenticationError) return "The Anthropic API key is missing or invalid.";
   if (e instanceof Anthropic.RateLimitError) return "AI rate limit reached; wait a moment and retry.";
   if (e instanceof Anthropic.APIError) return `AI error (${e.status}): ${e.message}`;
@@ -94,6 +100,22 @@ app.get("/api/status", async (c) => {
     .first<{ name: string }>()
     .catch(() => null);
   return c.json({ ok: true, migration: row?.name ?? null });
+});
+
+// Public, signed photo links so eBay can fetch listing photos (it copies them to its own servers).
+const pubSig = (env: Env, key: string) => hmac(env.SESSION_SECRET, `pub:${key}`);
+async function publicImageUrl(env: Env, origin: string, key: string) {
+  return `${origin}/pub/${key}?s=${await pubSig(env, key)}`;
+}
+
+app.get("/pub/:key{.+}", async (c) => {
+  const key = c.req.param("key");
+  if (c.req.query("s") !== (await pubSig(c.env, key))) return c.text("Not found", 404);
+  const obj = await c.env.PHOTOS.get(key);
+  if (!obj) return c.notFound();
+  return new Response(obj.body, {
+    headers: { "Content-Type": obj.httpMetadata?.contentType ?? "image/jpeg", "Cache-Control": "public, max-age=31536000, immutable" },
+  });
 });
 
 app.post("/api/logout", (c) => {
@@ -166,7 +188,7 @@ app.get("/api/settings", async (c) => c.json(await getSettings(c.env)));
 
 app.put("/api/settings", async (c) => {
   const body = await c.req.json<Record<string, string | number>>();
-  const allowed = ["location", "sell_threshold", "household_notes"];
+  const allowed = ["location", "sell_threshold", "household_notes", "ebay_postal_code"];
   const stmts = Object.entries(body)
     .filter(([k]) => allowed.includes(k))
     .map(([k, v]) =>
@@ -448,6 +470,98 @@ app.post("/api/bundle", async (c) => {
   } catch (e) {
     return c.json({ error: errorMessage(e) }, 502);
   }
+});
+
+// ---------- eBay ----------
+
+const ebayState = async (env: Env, ts: string) => `${ts}.${await hmac(env.SESSION_SECRET, `ebay:${ts}`)}`;
+
+app.get("/api/ebay", async (c) => c.json(await ebayStatus(c.env)));
+
+app.get("/api/ebay/connect", async (c) => {
+  if (!ebayConfigured(c.env)) return c.text("eBay isn't set up yet: add the EBAY_CLIENT_ID, EBAY_CLIENT_SECRET and EBAY_RU_NAME secrets.", 400);
+  return c.redirect(authorizeUrl(c.env, await ebayState(c.env, String(Date.now()))));
+});
+
+// eBay sends the browser back here after the user approves (the RuName's "auth accepted URL").
+app.get("/api/ebay/callback", async (c) => {
+  const code = c.req.query("code");
+  const state = c.req.query("state") ?? "";
+  const ts = state.split(".")[0];
+  const fresh = Number(ts) > Date.now() - 30 * 60_000;
+  if (!code || !fresh || state !== (await ebayState(c.env, ts))) return c.redirect("/#/settings?ebay=cancelled");
+  try {
+    await exchangeCode(c.env, code);
+    return c.redirect("/#/settings?ebay=connected");
+  } catch (e) {
+    return c.redirect(`/#/settings?ebay=error&msg=${encodeURIComponent(errorMessage(e))}`);
+  }
+});
+
+app.post("/api/ebay/disconnect", async (c) => {
+  await disconnect(c.env);
+  return c.json(await ebayStatus(c.env));
+});
+
+app.post("/api/items/:id/ebay", async (c) => {
+  const item = await getItem(c.env, c.req.param("id"));
+  if (!item) return c.json({ error: "Not found" }, 404);
+  const origin = new URL(c.req.url).origin;
+  const photo = item.photo_id
+    ? await c.env.DB.prepare("SELECT r2_key FROM photos WHERE id = ?").bind(item.photo_id).first<{ r2_key: string }>()
+    : null;
+  // Cleaned-up photo first, then the crop, then the full original (guarantees one large image).
+  const keys = [...new Set([item.enhanced_key, item.image_key, photo?.r2_key].filter((k): k is string => typeof k === "string" && !!k))];
+  const settings = await getSettings(c.env);
+  const details = [item.brand && `Brand: ${item.brand}`, item.size && `Size: ${item.size}`].filter(Boolean).join("\n");
+  const description = [String(item.listing_description || item.description), details, "Ships quickly from a smoke-free home."]
+    .filter(Boolean)
+    .join("\n\n");
+  try {
+    const r = await publishListing(
+      c.env,
+      {
+        sku: item.id,
+        title: String(item.listing_title || item.name),
+        description,
+        name: String(item.name),
+        brand: String(item.brand),
+        size: String(item.size),
+        condition: String(item.condition),
+        category: String(item.category),
+        quantity: Number(item.quantity) || 1,
+        price: Math.round(Number(item.asking_price) || Number(item.resale_high) || 0),
+        imageUrls: await Promise.all(keys.map((k) => publicImageUrl(c.env, origin, k))),
+      },
+      settings.ebay_postal_code,
+    );
+    const listedOn = item.listed_on as string[];
+    await c.env.DB.prepare(
+      "UPDATE items SET ebay_offer_id=?, ebay_listing_id=?, status=CASE WHEN status='active' THEN 'listed' ELSE status END, decision='sell', decision_confirmed=1, listed_on=?, updated_at=? WHERE id=?",
+    )
+      .bind(r.offerId, r.listingId, JSON.stringify(listedOn.includes("ebay") ? listedOn : [...listedOn, "ebay"]), now(), item.id)
+      .run();
+    return c.json({ item: await getItem(c.env, item.id), url: r.url, category: r.category });
+  } catch (e) {
+    return c.json({ error: errorMessage(e) }, 502);
+  }
+});
+
+app.delete("/api/items/:id/ebay", async (c) => {
+  const item = await getItem(c.env, c.req.param("id"));
+  if (!item) return c.json({ error: "Not found" }, 404);
+  try {
+    if (item.ebay_offer_id) await endListing(c.env, String(item.ebay_offer_id));
+  } catch (e) {
+    return c.json({ error: errorMessage(e) }, 502);
+  }
+  const listedOn = (item.listed_on as string[]).filter((p) => p !== "ebay");
+  await c.env.DB.prepare(
+    "UPDATE items SET ebay_listing_id=NULL, listed_on=?, status=CASE WHEN status='listed' AND ?=0 THEN 'active' ELSE status END, updated_at=? WHERE id=?",
+  )
+    .bind(JSON.stringify(listedOn), listedOn.length, now(), item.id)
+    .run();
+  return c.json({ item: await getItem(c.env, item.id) });
 });
 
 // ---------- export ----------

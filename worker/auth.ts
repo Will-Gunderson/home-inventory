@@ -6,7 +6,7 @@ const MAX_AGE_DAYS = 180;
 
 const enc = new TextEncoder();
 
-async function hmac(secret: string, data: string): Promise<string> {
+export async function hmac(secret: string, data: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     "raw",
     enc.encode(secret),

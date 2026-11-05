@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, imgUrl, type Decision, type Item } from "../api";
+import { api, ebayItemUrl, imgUrl, type Decision, type EbayStatus, type Item } from "../api";
 import { go, useStore } from "../store";
 import { DECISION_LABEL, DecisionPill, Icon, Sheet, Topbar, copyText, useToast } from "../ui";
 import { enhance, imagesAsFiles, type EnhanceMode } from "../lib/image";
@@ -163,7 +163,7 @@ export default function ItemDetail({ id }: { id: string }) {
         </>
       )}
 
-      {item.decision === "sell" && item.status !== "donated" && <SellPanel item={item} save={save} />}
+      {item.decision === "sell" && item.status !== "donated" && <SellPanel item={item} save={save} onItem={upsertItem} />}
 
       {item.decision === "donate" && item.status === "active" && (
         <button className="btn block" style={{ marginTop: 16 }} onClick={() => save({ status: "donated", decision_confirmed: true }, "Marked donated")}>
@@ -190,7 +190,7 @@ export default function ItemDetail({ id }: { id: string }) {
   );
 }
 
-function SellPanel({ item, save }: { item: Item; save: (p: Partial<Item>, msg?: string) => Promise<void> }) {
+function SellPanel({ item, save, onItem }: { item: Item; save: (p: Partial<Item>, msg?: string) => Promise<void>; onItem: (i: Item) => void }) {
   const toast = useToast();
   const [platform, setPlatform] = useState<SellPlatform>(suggestedPlatform(item));
   const [soldOpen, setSoldOpen] = useState(false);
@@ -235,6 +235,7 @@ function SellPanel({ item, save }: { item: Item; save: (p: Partial<Item>, msg?: 
         {platform === suggestedPlatform(item) && <><Icon name="sparkle" size={12} /> Suggested. </>}
         {info.note}
       </p>
+      {platform === "ebay" && <EbayPost item={item} onItem={onItem} />}
       <div className="card" style={{ padding: "4px 14px" }}>
         {fields.map((f) => (
           <div className="copyrow" key={f.label}>
@@ -287,6 +288,81 @@ function SellPanel({ item, save }: { item: Item; save: (p: Partial<Item>, msg?: 
         </Sheet>
       )}
     </>
+  );
+}
+
+let ebayStatusCache: Promise<EbayStatus | null> | null = null;
+
+function EbayPost({ item, onItem }: { item: Item; onItem: (i: Item) => void }) {
+  const toast = useToast();
+  const [status, setStatus] = useState<EbayStatus | null>(null);
+  const [busy, setBusy] = useState<"post" | "end" | null>(null);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    ebayStatusCache ??= api.ebayStatus().catch(() => null);
+    ebayStatusCache.then(setStatus);
+  }, []);
+
+  if (!status?.configured) return null;
+  if (!status.connected) {
+    return (
+      <p className="small" style={{ margin: "0 0 10px" }}>
+        <a href="#/settings">Connect your eBay account</a> to post this with one tap.
+      </p>
+    );
+  }
+
+  const post = async () => {
+    setBusy("post");
+    setErr("");
+    try {
+      const r = await api.postToEbay(item.id);
+      onItem(r.item);
+      toast(item.ebay_listing_id ? "eBay listing updated" : "Live on eBay!");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Couldn't post to eBay");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const end = async () => {
+    if (!confirm("End the eBay listing?")) return;
+    setBusy("end");
+    setErr("");
+    try {
+      onItem((await api.endEbay(item.id)).item);
+      toast("eBay listing ended");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Couldn't end the listing");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="stack" style={{ marginBottom: 12 }}>
+      {item.ebay_listing_id ? (
+        <div className="row">
+          <a className="btn primary grow" href={ebayItemUrl(item, status.sandbox)} target="_blank" rel="noreferrer">
+            <Icon name="external" size={18} /> View on eBay
+          </a>
+          <button className="btn" onClick={post} disabled={!!busy} title="Push your latest edits to eBay">
+            {busy === "post" ? <span className="spin" /> : "Update"}
+          </button>
+          <button className="btn danger" onClick={end} disabled={!!busy}>
+            {busy === "end" ? <span className="spin" /> : "End"}
+          </button>
+        </div>
+      ) : (
+        <button className="btn primary lg block" onClick={post} disabled={!!busy}>
+          {busy === "post" ? <><span className="spin" /> Posting to eBay…</> : <><Icon name="tag" size={18} /> Post to eBay for ${price(item)}</>}
+        </button>
+      )}
+      {busy === "post" && <p className="tiny muted" style={{ margin: 0 }}>Picking a category and filling in item specifics. About 10–20 seconds.</p>}
+      {err && <div className="err">{err}</div>}
+    </div>
   );
 }
 

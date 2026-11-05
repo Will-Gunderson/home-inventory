@@ -341,6 +341,89 @@ export async function writeBundlePost(
   return { title: r.title.slice(0, 80), body: r.body, total };
 }
 
+export interface AspectSpec {
+  name: string;
+  required: boolean;
+  selectionOnly: boolean;
+  maxLength: number;
+  values: string[];
+}
+
+/** Fill an eBay category's item specifics (Brand, Size, Color, Type…) from what we know about the item. */
+export async function fillAspects(
+  env: Env,
+  item: { name: string; brand: string; size: string; description: string; title: string },
+  categoryPath: string,
+  specs: AspectSpec[],
+): Promise<Record<string, string[]>> {
+  if (!specs.length) return {};
+  let filled: { name: string; value: string }[];
+  if (env.MOCK_AI === "1") {
+    filled = specs.filter((s) => s.required).map((s) => ({ name: s.name, value: s.name === "Brand" ? item.brand || "Unbranded" : s.values[0] ?? "Unknown" }));
+  } else {
+    const specText = specs
+      .map((s) => `- ${s.name}${s.required ? " (REQUIRED)" : ""}${s.values.length ? `${s.selectionOnly ? " — must be one of" : " — e.g."}: ${s.values.join(" | ")}` : ""}`)
+      .join("\n");
+    const msg = await client(env).beta.messages.create({
+      model: model(env),
+      max_tokens: 4000,
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default",
+      output_config: {
+        effort: "low",
+        format: {
+          type: "json_schema",
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            required: ["aspects"],
+            properties: {
+              aspects: {
+                type: "array",
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["name", "value"],
+                  properties: { name: { type: "string" }, value: { type: "string" } },
+                },
+              },
+            },
+          },
+        },
+      },
+      messages: [
+        {
+          role: "user",
+          content: `Fill in eBay item specifics for this listing in the category "${categoryPath}".
+
+Item: ${item.name}
+Title: ${item.title}
+Brand: ${item.brand || "(unknown)"}
+Size: ${item.size || "(unknown)"}
+Description: ${item.description}
+
+Item specifics:
+${specText}
+
+Return every REQUIRED specific. Add the others only when the item details make the answer clear; don't guess. When a value list is given, prefer its exact wording. If the brand is unknown, use "Unbranded". For a required specific you can't determine, use "Unknown" unless the list offers something better (e.g. "Does Not Apply").`,
+        },
+      ],
+    });
+    filled = (JSON.parse(textOf(msg)) as { aspects: { name: string; value: string }[] }).aspects;
+  }
+
+  const out: Record<string, string[]> = {};
+  for (const f of filled) {
+    const spec = specs.find((s) => s.name.toLowerCase() === f.name.trim().toLowerCase());
+    const value = f.value?.trim();
+    if (!spec || !value) continue;
+    const match = spec.values.find((v) => v.toLowerCase() === value.toLowerCase());
+    if (spec.selectionOnly && spec.values.length && !match) continue;
+    out[spec.name] = [(match ?? value).slice(0, spec.maxLength)];
+  }
+  return out;
+}
+
 /** Local-dev stand-in so the UI can be exercised without an API key (set MOCK_AI=1 in .dev.vars). */
 function mockAnalysis(ctx: AnalyzeContext): PhotoAnalysis {
   const base = {

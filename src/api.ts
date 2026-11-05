@@ -50,6 +50,8 @@ export interface Item {
     checked_at: string;
   } | null;
   notes: string;
+  ebay_offer_id: string | null;
+  ebay_listing_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -58,6 +60,14 @@ export interface Settings {
   location: string;
   sell_threshold: number;
   household_notes: string;
+  ebay_postal_code: string;
+}
+
+export interface EbayStatus {
+  configured: boolean;
+  connected: boolean;
+  sandbox: boolean;
+  policies: { shipping: string; payment: string; returns: string } | null;
 }
 
 export interface PhotoResult {
@@ -141,9 +151,16 @@ export const api = {
     req<{ id: string; room_id: string; room_name: string; r2_key: string; error: string; created_at: string }[]>("/api/photos/failed"),
   deletePhoto: (id: string) => req(`/api/photos/${id}`, { method: "DELETE" }),
 
+  ebayStatus: () => req<EbayStatus>("/api/ebay"),
+  ebayDisconnect: () => req<EbayStatus>("/api/ebay/disconnect", { method: "POST" }),
+  postToEbay: (id: string) => req<{ item: Item; url: string; category: string }>(`/api/items/${id}/ebay`, { method: "POST" }),
+  endEbay: (id: string) => req<{ item: Item }>(`/api/items/${id}/ebay`, { method: "DELETE" }),
+
   bundle: (ids: string[], kind: "garage_sale" | "marketplace_bundle", details: string) =>
     req<{ title: string; body: string; total: number }>("/api/bundle", json("POST", { ids, kind, details })),
 };
 
 export const imgUrl = (key: string | null | undefined) => (key ? `/img/${key}` : "");
+export const ebayItemUrl = (i: Item, sandbox = false) =>
+  i.ebay_listing_id ? `https://${sandbox ? "sandbox" : "www"}.ebay.com/itm/${i.ebay_listing_id}` : "";
 export const itemImage = (i: Item) => imgUrl(i.enhanced_key ?? i.image_key);

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { api, imgUrl } from "../api";
-import { useStore } from "../store";
+import { api, imgUrl, type EbayStatus } from "../api";
+import { go, useRoute, useStore } from "../store";
 import { Icon, Topbar, useToast } from "../ui";
 
 export default function SettingsScreen() {
@@ -45,6 +45,8 @@ export default function SettingsScreen() {
         </label>
         <button className="btn primary">Save</button>
       </form>
+
+      <EbayCard />
 
       <h2>Rooms</h2>
       <div className="card" style={{ padding: "4px 14px" }}>
@@ -154,6 +156,83 @@ export default function SettingsScreen() {
       >
         Sign out
       </button>
+    </>
+  );
+}
+
+function EbayCard() {
+  const { settings, setSettings } = useStore();
+  const { params } = useRoute();
+  const toast = useToast();
+  const [status, setStatus] = useState<EbayStatus | null>(null);
+  const [zip, setZip] = useState(settings?.ebay_postal_code ?? "");
+
+  useEffect(() => {
+    api.ebayStatus().then(setStatus, () => {});
+    const result = params.get("ebay");
+    if (result) {
+      toast(result === "connected" ? "eBay connected" : result === "error" ? params.get("msg") || "eBay sign-in failed" : "eBay sign-in cancelled");
+      go("/settings");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => setZip(settings?.ebay_postal_code ?? ""), [settings?.ebay_postal_code]);
+
+  if (!status) return null;
+  return (
+    <>
+      <h2>eBay</h2>
+      <div className="card stack">
+        {!status.configured ? (
+          <p className="small muted" style={{ margin: 0 }}>
+            Not set up yet: add the EBAY_CLIENT_ID, EBAY_CLIENT_SECRET and EBAY_RU_NAME secrets (see README).
+          </p>
+        ) : status.connected ? (
+          <>
+            <div className="row">
+              <Icon name="check" size={18} />
+              <b className="grow">Connected{status.sandbox ? " (sandbox)" : ""}</b>
+              <button
+                className="btn sm ghost danger"
+                onClick={async () => {
+                  if (!confirm("Disconnect eBay? Existing listings stay live.")) return;
+                  setStatus(await api.ebayDisconnect());
+                }}
+              >
+                Disconnect
+              </button>
+            </div>
+            {status.policies && (
+              <p className="tiny muted" style={{ margin: 0 }}>
+                Listings use: {status.policies.shipping} · {status.policies.payment} · {status.policies.returns}
+              </p>
+            )}
+          </>
+        ) : (
+          <>
+            <p className="small muted" style={{ margin: 0 }}>Connect once, then post any item to eBay with one tap.</p>
+            <a className="btn primary block" href="/api/ebay/connect">
+              <Icon name="external" size={18} /> Connect eBay account
+            </a>
+          </>
+        )}
+        {status.configured && (
+          <form
+            className="row"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              setSettings(await api.saveSettings({ ebay_postal_code: zip.trim() }));
+              toast("Saved");
+            }}
+          >
+            <label className="field grow">
+              <span>Ship-from ZIP code</span>
+              <input className="input" inputMode="numeric" autoComplete="postal-code" value={zip} placeholder="e.g. 55401" onChange={(e) => setZip(e.target.value)} />
+            </label>
+            <button className="btn" style={{ alignSelf: "flex-end" }}>Save</button>
+          </form>
+        )}
+      </div>
     </>
   );
 }
