@@ -88,6 +88,14 @@ app.post("/api/login", async (c) => {
   return c.json({ ok: true });
 });
 
+// Public, no data: lets a deploy be verified (latest applied migration).
+app.get("/api/status", async (c) => {
+  const row = await c.env.DB.prepare("SELECT name FROM d1_migrations ORDER BY id DESC LIMIT 1")
+    .first<{ name: string }>()
+    .catch(() => null);
+  return c.json({ ok: true, migration: row?.name ?? null });
+});
+
 app.post("/api/logout", (c) => {
   c.header("Set-Cookie", clearCookie());
   return c.json({ ok: true });

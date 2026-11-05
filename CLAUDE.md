@@ -9,7 +9,7 @@ Will wants every requested change to go live without extra steps. After making a
 1. `npx tsc -b` and `npm run build` must pass.
 2. Commit to `main` and `git push origin main` (run `git pull --rebase origin main` first).
 3. The GitHub Action in `.github/workflows/deploy.yml` builds, applies D1 migrations and deploys to Cloudflare, which takes about 1–2 minutes.
-4. Confirm it's live: `curl -s https://home.willgunderson.com/ | grep -o '/assets/index-[^"]*\.js'` should show the new bundle hash from `dist/client/index.html`. Tell Will if it doesn't update.
+4. Confirm it's live: `curl -s https://home.willgunderson.com/ | grep -o '/assets/index-[^"]*\.js'` should show the new bundle hash from `dist/client/index.html`. For database-only changes, `curl -s https://home.willgunderson.com/api/status` should report the newest migration file. Tell Will if it doesn't update.
 
 ## Conventions
 
