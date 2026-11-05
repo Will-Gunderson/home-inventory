@@ -13,7 +13,7 @@
       "binding": "DB",
       "database_name": "home-inventory",
       // Replace with the id printed by `npx wrangler d1 create home-inventory`
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "c0ec59db-6b90-40f2-bf86-f7352edb7358",
       "migrations_dir": "migrations"
     }
   ],
